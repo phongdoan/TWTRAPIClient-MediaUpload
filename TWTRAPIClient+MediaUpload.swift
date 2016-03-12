@@ -13,11 +13,110 @@
 import Foundation
 import TwitterKit
 
+public enum TWTRMediaUploadStatus
+{
+    case Init(totalBytes:Int, mimeType:String);
+    case Inited(mediaId:String);
+    case Append(mediaId:String, totalSegmentCount:Int);
+    case Appended(mediaId:String);
+    case SegmentAppend(mediaId:String, segmentIndex:Int, remainingSegmentCount:Int);
+    case SegmentAppended(mediaId:String, segmentIndex:Int);
+    case Finalize(mediaId:String);
+    case Finalized(mediaId:String);
+    case Error(mediaId:String?, message:String);
+    
+    func toString() -> String
+    {
+        switch (self)
+        {
+            case .Init(let totalBytes, let mimeType) :
+                return "TWTRMediaUploadStatus.Init(totalBytes:\(totalBytes), mimeType:\(mimeType))";
+            
+            case .Inited(let mediaId) :
+                return "TWTRMediaUploadStatus.Inited(mediaId:\(mediaId))";
+            
+            case .Append(let mediaId, let totalSegmentCount) :
+                return "TWTRMediaUploadStatus.Append(mediaId:\(mediaId), totalSegmentCount:\(totalSegmentCount))";
+                
+            case .Appended(let mediaId) :
+                return "TWTRMediaUploadStatus.Appended(mediaId:\(mediaId))";
+                
+            case .SegmentAppend(let mediaId, let segmentIndex, let remainingSegmentCount) :
+                return "TWTRMediaUploadStatus.SegmentAppend(mediaId:\(mediaId), segementIndex:\(segmentIndex), remainingSegmentCount:\(remainingSegmentCount))";
+                
+            case .SegmentAppended(let mediaId, let segmentIndex) :
+                return "TWTRMediaUploadStatus.SegmentAppended(mediaId:\(mediaId), segmentIndex: \(segmentIndex))";
+                
+            case .Finalize(let mediaId) :
+                return "TWTRMediaUploadStatus.Finalize(mediaId:\(mediaId))";
+                
+            case .Finalized(let mediaId) :
+                return "TWTRMediaUploadStatus.Finalized(mediaId:\(mediaId))";
+                
+            case .Error(let mediaId, let message) :
+                return "TWTRMediaUploadStatus.Error(mediaId:\(mediaId), message:\(message))";
+        }
+    }
+}
+
+public typealias TWTRStatusUpdateCallback = (tweet:TWTRTweet?, error:NSError?) -> Void;
+
+public typealias TWTRMediaUploadCallback = (mediaId:String?, error:NSError?) -> Void;
+
+public typealias TWTRMediaUploadStatusCallback = (status:TWTRMediaUploadStatus) -> Void;
+
+/**
+ * Used to wrap closure to store in associated objects.
+ */
+private class ClosureWrapper : NSObject, NSCopying
+{
+    convenience init(closure: TWTRMediaUploadStatusCallback?)
+    {
+        self.init()
+        self.closure = closure;
+    }
+    
+    var closure:TWTRMediaUploadStatusCallback?;
+    
+    @objc
+    func copyWithZone(zone: NSZone) -> AnyObject
+    {
+        let wrapper: ClosureWrapper = ClosureWrapper()
+        wrapper.closure = self.closure;
+        
+        return wrapper
+    }
+}
+
 extension TWTRAPIClient
 {
+    private struct AssociatedKeys
+    {
+        static var MediaUploadCallback:String = "MediaUploadCallback";
+    }
+
+    // MARK: Properties
+
+    var mediaUploadStatusCallback: TWTRMediaUploadStatusCallback?
+    {
+        get
+        {
+            if let wrapper = objc_getAssociatedObject(self, &AssociatedKeys.MediaUploadCallback) as? ClosureWrapper
+            {
+                return wrapper.closure;
+            }
+            
+            return nil;
+        }
+        set
+        {
+            objc_setAssociatedObject(self, &AssociatedKeys.MediaUploadCallback, ClosureWrapper(closure: newValue), objc_AssociationPolicy.OBJC_ASSOCIATION_RETAIN);
+        }
+    }
+    
     // MARK: Extension API
 
-    func updateStatus(status:String, mediaURL:NSURL, mimeType:String?, callback:(tweet:TWTRTweet?, error:NSError?) -> ())
+    func statusUpdate(status:String, mediaURL:NSURL, mimeType:String?, callback:TWTRStatusUpdateCallback)
     {
         if let data:NSData = NSData(contentsOfURL: mediaURL)
         {
@@ -29,7 +128,7 @@ extension TWTRAPIClient
         }
     }
 
-    func statusUpdate(status:String, mediaData:NSData, mimeType:String?, callback:(tweet:TWTRTweet?, error:NSError?) -> ())
+    func statusUpdate(status:String, mediaData:NSData, mimeType:String?, callback:TWTRStatusUpdateCallback)
     {
         let STATUS_UPDATE_ENDPOINT:String = "https://api.twitter.com/1.1/statuses/update.json";
 
@@ -41,8 +140,8 @@ extension TWTRAPIClient
             {
                 let params =
                 [
-                        "status" : status,
-                        "media_ids" : mediaId!
+                    "status" : status,
+                    "media_ids" : mediaId!
                 ];
 
                 var tweetError:NSError?;
@@ -87,17 +186,15 @@ extension TWTRAPIClient
         };
     }
     
-    func mediaUploadChunked(data:NSData, mimeType:String, callback:(mediaId:String?, error:NSError?) -> ())
+    func mediaUploadChunked(data:NSData, mimeType:String, callback:TWTRMediaUploadCallback)
     {
         let MEDIA_UPLOAD_ENDPOINT = "https://upload.twitter.com/1.1/media/upload.json";
         
-        print("Media upload started");
-        
         var chunks:[NSData] = self.separateMediaToChunks(data);
         
-        func initUpload(callback:(mediaId:String?, error:NSError?) -> ())
+        func initUpload(callback:TWTRMediaUploadCallback)
         {
-            print("initUpload started");
+            self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Init(totalBytes: data.length, mimeType: mimeType));
             
             let params =
             [
@@ -121,47 +218,61 @@ extension TWTRAPIClient
                             
                             if let mediaId = json?["media_id_string"] as? NSString
                             {
-                                print("initUpload finished");
+                                self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Inited(mediaId: mediaId as String));
                                 
                                 callback(mediaId: mediaId as String, error: nil);
                             }
                             else
                             {
-                                callback(mediaId: nil, error: NSError(domain: TWTRErrorDomain, code: TWTRErrorCode.Unknown.rawValue, userInfo: [NSLocalizedDescriptionKey : "Error parsing received data"]));
+                                self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: "Could not obtain media_id_string from response"));
+                                
+                                callback(mediaId: nil, error: NSError(domain: TWTRErrorDomain, code: TWTRErrorCode.Unknown.rawValue, userInfo: [NSLocalizedDescriptionKey : "Could not obtain media_id_string from response"]));
                             }
                         }
                         catch let parseError as NSError
                         {
+                            self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: parseError.localizedDescription));
+                            
                             callback(mediaId: nil, error: parseError);
                         }
                         catch
                         {
+                            self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: "Error parsing received data"));
+                            
                             callback(mediaId: nil, error: NSError(domain: TWTRAPIErrorDomain, code: TWTRErrorCode.Unknown.rawValue, userInfo: [NSLocalizedDescriptionKey : "Error parsing received data"]));
                         }
                     }
                     else
                     {
+                        self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: responseError!.localizedDescription));
+                        
                         callback(mediaId: nil, error: responseError);
                     }
                 };
             }
             else
             {
+                self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: initError!.localizedDescription));
+                
                 callback(mediaId: nil, error: initError);
             }
         }
         
-        func appendChunks(mediaId:String, segmentIndex:Int, callback:(mediaId:String?, error:NSError?) -> ())
+        func appendChunks(mediaId:String, segmentIndex:Int, callback:TWTRMediaUploadCallback)
         {
-            print("appendChunks for mediaId '\(mediaId)' and segment '\(segmentIndex)' started");
+            self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Append(mediaId: mediaId, totalSegmentCount: chunks.count));
             
             if chunks.isEmpty
             {
+                self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Appended(mediaId: mediaId));
+                
                 callback(mediaId: mediaId, error: nil);
             }
             else
             {
                 let chunk = chunks.removeFirst();
+                
+                self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.SegmentAppend(mediaId: mediaId, segmentIndex: segmentIndex, remainingSegmentCount: chunks.count));
                 
                 let params:[String : String] =
                 [
@@ -178,30 +289,32 @@ extension TWTRAPIClient
                 {
                     self.sendTwitterRequest(request) { (response:NSURLResponse?, responseData:NSData?, responseError:NSError?) -> Void in
                         
-                        print(response);
-                        
                         if responseError == nil
                         {
-                            print("appendchunks for segement '\(segmentIndex)' finished");
+                            self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.SegmentAppended(mediaId: mediaId, segmentIndex: segmentIndex));
                             
                             appendChunks(mediaId, segmentIndex: segmentIndex + 1, callback: callback);
                         }
                         else
                         {
+                            self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: responseError!.localizedDescription));
+                            
                             callback(mediaId: nil, error: responseError);
                         }
                     };
                 }
                 else
                 {
+                    self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: appendError!.localizedDescription));
+                    
                     callback(mediaId: nil, error: appendError);
                 }
             }
         }
         
-        func finalizeUpload(mediaId:String, callback:(mediaId:String?, error:NSError?) -> ())
+        func finalizeUpload(mediaId:String, callback:TWTRMediaUploadCallback)
         {
-            print("finalizeUpload started for mediaId '\(mediaId)'");
+            self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Finalize(mediaId: mediaId));
             
             let params =
             [
@@ -216,30 +329,30 @@ extension TWTRAPIClient
             {
                 self.sendTwitterRequest(request) { (response:NSURLResponse?, responseData:NSData?, responseError:NSError?) -> Void in
                     
-                    print(response);
-                    
                     if responseError == nil
                     {
-                        print("finalize upload finished");
+                        self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Finalized(mediaId: mediaId));
                         
                         callback(mediaId: mediaId, error: nil);
                     }
                     else
                     {
+                        self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: responseError!.localizedDescription));
+                        
                         callback(mediaId: nil, error: responseError);
                     }
                 }
             }
             else
             {
+                self.mediaUploadStatusCallback?(status: TWTRMediaUploadStatus.Error(mediaId: nil, message: finalizeError!.localizedDescription));
+                
                 callback(mediaId: nil, error: finalizeError);
             }
         }
         
         func checkStatus(mediaId:String, callback:(ready:Bool, error:NSError?) -> ())
         {
-            print("checkStatus started for mediaId '\(mediaId)'");
-            
             let params =
             [
                 "command" : "STATUS",
@@ -253,18 +366,12 @@ extension TWTRAPIClient
             {
                 self.sendTwitterRequest(request) { (response:NSURLResponse?, responseData:NSData?, responseError:NSError?) -> Void in
                     
-                    print(response);
-                    
                     if responseError == nil
                     {
                         do
                         {
                             let json = try NSJSONSerialization.JSONObjectWithData(responseData!, options: .MutableContainers);
-                            
-                            print(json);
-                            
-                            print("checkStatus finished");
-                            
+
                             callback(ready: true, error: nil);
                         }
                         catch let parseError as NSError
@@ -312,7 +419,7 @@ extension TWTRAPIClient
 //                                        }
 //                                        else
 //                                        {
-//                                            // TODO: Let's try check status after timeout
+//                                            // TODO: Let's try check status after timeout (only if upload video)
 //
 //                                            callback(mediaId: nil, error: NSError(domain: TWTRErrorDomain, code: TWTRErrorCode.Unknown.rawValue, userInfo: nil));
 //                                        }
@@ -346,7 +453,7 @@ extension TWTRAPIClient
     
     func separateMediaToChunks(data:NSData) -> [NSData]
     {
-        let MAX_CHUNK_SIZE:Int = 1000 * 1000 * 5;
+        let MAX_CHUNK_SIZE:Int = 1000 * 1000 * 2; // 2Mb
         
         var chunks:[NSData] = [];
         
